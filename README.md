@@ -12,6 +12,11 @@ It enforces a strict separation between:
 
 Gate is designed for environments where **AI must not execute actions autonomously** without explicit policy or human approval.
 
+## Ecosystem
+Gate is a standardized control plane. For specific implementations, see:
+- **[RiskGuard](https://github.com/Kkasuga904/RiskGuard)**: The core policy and risk evaluation engine.
+- **[WinOps-Guard](https://github.com/Kkasuga904/WinOps-Guard)**: A reference implementation for secure Windows infrastructure operations.
+
 ## Core concept
 
 AI can propose actions. Humans (or policies) decide. Gate executes only after approval.

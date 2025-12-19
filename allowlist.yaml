@@ -1,0 +1,8 @@
+commands:
+  - name: restart_service
+    path: "C:\\Windows\\System32\\net.exe"
+    args: ["stop", "Spooler"]
+
+  - name: gather_logs
+    path: "C:\\Windows\\System32\\wevtutil.exe"
+    args: ["qe", "System", "/c:10"]

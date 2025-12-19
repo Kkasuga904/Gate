@@ -1,0 +1,19 @@
+
+{
+
+"agent_id": "triage-ai",
+
+"intent": "gather_logs",
+
+"env": "test",
+
+"target": "host01",
+
+"command": "gather_logs",
+
+"reason": "smoke test",
+
+"risk_level": "medium"
+
+}
+

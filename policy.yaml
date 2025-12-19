@@ -1,0 +1,11 @@
+rules:
+  - intent: restart_service
+    env: prod
+    require_approval: true
+
+  - intent: disk_format
+    allow: false
+
+  - intent: gather_logs
+    env: test
+    require_approval: true

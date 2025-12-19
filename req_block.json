@@ -1,0 +1,17 @@
+
+{
+
+"agent_id": "test-ai",
+
+"intent": "delete_dir",
+
+"target": "C:\\temp\\gate-test",
+
+"command": "rmdir /s /q C:\\temp\\gate-test",
+
+"reason": "test block",
+
+"risk_level": "high"
+
+}
+

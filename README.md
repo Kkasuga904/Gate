@@ -1,6 +1,8 @@
 
 
 # Gate
+> **Vision & Standard:** Gate is part of a larger architecture for enterprise AI agent governance.  
+> Read our [VISION.md](./VISION.md) for the core principles of the Gate execution model.
 
 Gate is a **human-approval execution gateway** for AI agents and automation tools.
 

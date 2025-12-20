@@ -6,11 +6,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -30,6 +33,14 @@ const (
 	statusApproved = "approved"
 )
 
+const (
+	demoIntent      = "delete_dir"
+	demoTarget      = "C:\\temp\\gate-test"
+	demoRisk        = "high"
+	demoCommandLine = "rmdir /s /q C:\\temp\\gate-test"
+	demoCmdPath     = "C:\\Windows\\System32\\cmd.exe"
+)
+
 var allowedRisks = map[string]struct{}{
 	"low":    {},
 	"medium": {},
@@ -44,6 +55,12 @@ type executionRequest struct {
 	Command   string `json:"command"`
 	Reason    string `json:"reason"`
 	RiskLevel string `json:"risk_level"`
+}
+
+type Request = executionRequest
+
+func demoAllowWithApproval(req Request) bool {
+	return req.Intent == "delete_dir"
 }
 
 type requestRecord struct {
@@ -93,17 +110,29 @@ type auditEntry struct {
 }
 
 func main() {
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "approve":
-			handleApproveCLI()
-			return
-		case "deny":
-			handleDenyCLI()
-			return
-		}
+	if len(os.Args) == 1 {
+		startServer()
+		return
 	}
-	startServer()
+
+	switch os.Args[1] {
+	case "submit":
+		handleSubmitCLI()
+		return
+	case "approve":
+		handleApproveCLI()
+		return
+	case "deny":
+		handleDenyCLI()
+		return
+	case "help", "-h", "--help":
+		printUsage()
+		return
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", os.Args[1])
+		printUsage()
+		os.Exit(2)
+	}
 }
 
 func startServer() {
@@ -111,11 +140,47 @@ func startServer() {
 	mux.HandleFunc("/execution/request", handleExecutionRequest)
 
 	addr := ":8080"
-	fmt.Printf("Gate listening on %s\n", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		if isAddrAlreadyInUse(err) {
+			fmt.Printf("Gate already running on %s. Exiting.\n", addr)
+			return
+		}
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}
+
+	fmt.Printf("Gate listening on %s\n", addr)
+	server := &http.Server{Handler: mux}
+	if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func printUsage() {
+	exe := filepath.Base(os.Args[0])
+	fmt.Fprintf(os.Stderr, "Usage:\n")
+	fmt.Fprintf(os.Stderr, "  %s\n", exe)
+	fmt.Fprintf(os.Stderr, "  %s submit <request.json>\n", exe)
+	fmt.Fprintf(os.Stderr, "  %s approve --request-id <id> --user <user> --comment <text>\n", exe)
+	fmt.Fprintf(os.Stderr, "  %s deny --request-id <id> --user <user> --comment <text>\n", exe)
+}
+
+func isAddrAlreadyInUse(err error) bool {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		if errno == 10048 { // Windows WSAEADDRINUSE
+			return true
+		}
+		if errno == syscall.EADDRINUSE {
+			return true
+		}
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "address already in use") ||
+		strings.Contains(msg, "only one usage of each socket address")
 }
 
 func handleExecutionRequest(w http.ResponseWriter, r *http.Request) {
@@ -136,6 +201,12 @@ func handleExecutionRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	name := req.Intent
+	if strings.TrimSpace(name) == "" {
+		name = req.Command
+	}
+	fmt.Printf("New request received: %s (Risk: %s)\n", name, strings.ToUpper(req.RiskLevel))
 
 	policyCfg, err := loadPolicy(policyFile)
 	if err != nil {
@@ -172,6 +243,12 @@ func handleExecutionRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if decision.comment != "" {
+		rec.DecisionBy = "policy"
+		rec.Decision = statusPending
+		rec.Comment = decision.comment
+	}
+
 	if err := persistRequest(rec); err != nil {
 		http.Error(w, "failed to persist request", http.StatusInternalServerError)
 		return
@@ -193,6 +270,7 @@ type policyDecision struct {
 	allowed         bool
 	requireApproval bool
 	reason          string
+	comment         string
 }
 
 func evaluatePolicy(req executionRequest, cfg policyConfig) policyDecision {
@@ -231,11 +309,40 @@ func evaluatePolicy(req executionRequest, cfg policyConfig) policyDecision {
 		return decision
 	}
 
+	if demoAllowWithApproval(req) {
+		return policyDecision{
+			allowed:         true,
+			requireApproval: true,
+			comment:         "requires human approval (demo rule)",
+		}
+	}
+
 	return policyDecision{
 		allowed:         false,
 		requireApproval: true,
 		reason:          "no matching policy rule",
 	}
+}
+
+func isDemoException(req executionRequest) bool {
+	return req.Intent == demoIntent &&
+		req.Target == demoTarget &&
+		strings.EqualFold(req.RiskLevel, demoRisk)
+}
+
+func demoAllowedCommand(req executionRequest) (allowedCommand, bool) {
+	if !isDemoException(req) {
+		return allowedCommand{}, false
+	}
+	if req.Command != demoCommandLine {
+		return allowedCommand{}, false
+	}
+
+	return allowedCommand{
+		Name: demoIntent,
+		Path: demoCmdPath,
+		Args: []string{"/C", "rmdir", "/s", "/q", demoTarget},
+	}, true
 }
 
 func validateRequest(req executionRequest) error {
@@ -363,6 +470,72 @@ func findAllowedCommand(name string, cfg allowlist) (allowedCommand, bool) {
 	return allowedCommand{}, false
 }
 
+func handleSubmitCLI() {
+	fs := flag.NewFlagSet("submit", flag.ExitOnError)
+	serverURL := fs.String("url", "http://localhost:8080/execution/request", "Gate server URL")
+	fs.Parse(os.Args[2:])
+
+	if fs.NArg() != 1 {
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	payloadPath := fs.Arg(0)
+	payload, err := os.ReadFile(payloadPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to read %s: %v\n", payloadPath, err)
+		os.Exit(1)
+	}
+	if !json.Valid(payload) {
+		fmt.Fprintf(os.Stderr, "invalid JSON: %s\n", payloadPath)
+		os.Exit(1)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, *serverURL, bytes.NewReader(payload))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to build request: %v\n", err)
+		os.Exit(1)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "request failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		fmt.Fprintf(os.Stderr, "failed to read response: %v\n", readErr)
+		os.Exit(1)
+	}
+
+	type submitResponse struct {
+		RequestID int    `json:"request_id"`
+		Status    string `json:"status"`
+		Reason    string `json:"reason"`
+		Message   string `json:"message"`
+	}
+
+	var parsed submitResponse
+	if len(body) > 0 && json.Unmarshal(body, &parsed) == nil && parsed.RequestID != 0 {
+		fmt.Printf("Request submitted. ID: %d\n", parsed.RequestID)
+		return
+	}
+
+	if len(body) > 0 {
+		_, _ = os.Stdout.Write(body)
+		if body[len(body)-1] != '\n' {
+			_, _ = os.Stdout.Write([]byte("\n"))
+		}
+		return
+	}
+
+	fmt.Fprintf(os.Stdout, "%s\n", resp.Status)
+}
+
 func handleApproveCLI() {
 	fs := flag.NewFlagSet("approve", flag.ExitOnError)
 	requestID := fs.Int("request-id", 0, "Request identifier")
@@ -432,10 +605,17 @@ func approveRequest(id int, approver, comment string) error {
 	}
 	cmdDef, ok := findAllowedCommand(rec.Request.Command, allowCfg)
 	if !ok {
-		return fmt.Errorf("requested command %q not in allowlist", rec.Request.Command)
+		cmdDef, ok = demoAllowedCommand(rec.Request)
+		if !ok {
+			return fmt.Errorf("requested command %q not in allowlist", rec.Request.Command)
+		}
 	}
 
+	fmt.Println("Approved by human")
+	fmt.Println("Executing command...")
 	output, execErr := executeCommand(cmdDef)
+	exitCode := exitCodeFromError(execErr)
+	fmt.Println("Execution finished")
 	now := time.Now().UTC()
 
 	rec.Status = statusApproved
@@ -447,7 +627,7 @@ func approveRequest(id int, approver, comment string) error {
 	if execErr != nil {
 		rec.ExecutionError = execErr.Error()
 	} else {
-		persistErr := persistOutput(rec.ID, output)
+		persistErr := persistOutput(rec, output, exitCode)
 		if persistErr != nil {
 			rec.ExecutionError = fmt.Sprintf("output persist failed: %v", persistErr)
 			rec.Executed = false
@@ -520,6 +700,17 @@ func executeCommand(cmdDef allowedCommand) ([]byte, error) {
 	return buf.Bytes(), err
 }
 
+func exitCodeFromError(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return -1
+}
+
 func appendAudit(requestID int, agentID, intent, approver, decision string, executed bool, comment string) {
 	entry := auditEntry{
 		RequestID:  requestID,
@@ -556,15 +747,33 @@ func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func persistOutput(id int, data []byte) error {
+func persistOutput(rec requestRecord, data []byte, exitCode int) error {
 	if err := os.MkdirAll(outputsDir, 0755); err != nil {
 		return err
 	}
-	filename := fmt.Sprintf("request-%d.txt", id)
+	filename := fmt.Sprintf("request-%d.txt", rec.ID)
 	fullPath := filepath.Join(outputsDir, filename)
 	tmp := fullPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "Request ID: %d\n", rec.ID)
+	fmt.Fprintf(&buf, "Command: %s\n", rec.Request.Command)
+	fmt.Fprintf(&buf, "Decision: %s\n", rec.Decision)
+	fmt.Fprintf(&buf, "Approved By: %s\n", rec.DecisionBy)
+	fmt.Fprintf(&buf, "Exit Code: %d\n", exitCode)
+	buf.WriteString("\n--- Output ---\n")
+	if len(data) > 0 {
+		buf.Write(data)
+		if data[len(data)-1] != '\n' {
+			buf.WriteByte('\n')
+		}
+	} else {
+		buf.WriteString("(no output)\n")
+	}
+
+	if err := os.WriteFile(tmp, buf.Bytes(), 0644); err != nil {
 		return err
 	}
 	return os.Rename(tmp, fullPath)
+
 }

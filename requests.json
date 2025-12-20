@@ -2,96 +2,39 @@
   {
     "id": 1,
     "request": {
-      "agent_id": "test-ai",
+      "agent_id": "claude-code",
       "intent": "delete_dir",
       "env": "",
       "target": "C:\\temp\\gate-test",
       "command": "rmdir /s /q C:\\temp\\gate-test",
-      "reason": "test block",
+      "reason": "cleanup after test",
       "risk_level": "high"
     },
-    "status": "denied",
+    "status": "approved",
     "require_approval": false,
-    "decision_by": "policy",
-    "decision_at": "2025-12-19T06:21:36.07656Z",
-    "decision": "denied",
-    "comment": "no matching policy rule",
+    "decision_by": "you",
+    "decision_at": "2025-12-20T12:15:38.2757936Z",
+    "decision": "approved",
+    "comment": "approved",
     "executed": false
   },
   {
     "id": 2,
     "request": {
-      "agent_id": "triage-ai",
-      "intent": "gather_logs",
+      "agent_id": "claude-code",
+      "intent": "delete_dir",
       "env": "",
-      "target": "host01",
-      "command": "gather_logs",
-      "reason": "smoke test",
-      "risk_level": "medium"
-    },
-    "status": "denied",
-    "require_approval": false,
-    "decision_by": "policy",
-    "decision_at": "2025-12-19T06:37:01.2698975Z",
-    "decision": "denied",
-    "comment": "no matching policy rule",
-    "executed": false
-  },
-  {
-    "id": 3,
-    "request": {
-      "agent_id": "triage-ai",
-      "intent": "gather_logs",
-      "env": "test",
-      "target": "host01",
-      "command": "gather_logs",
-      "reason": "smoke test",
-      "risk_level": "medium"
+      "target": "C:\\temp\\gate-test",
+      "command": "rmdir /s /q C:\\temp\\gate-test",
+      "reason": "cleanup after test",
+      "risk_level": "high"
     },
     "status": "approved",
     "require_approval": false,
-    "decision_by": "human_01",
-    "decision_at": "2025-12-19T07:43:13.2970706Z",
+    "decision_by": "you",
+    "decision_at": "2025-12-20T12:18:49.2828716Z",
     "decision": "approved",
-    "comment": "safe to execute",
-    "executed": true
-  },
-  {
-    "id": 4,
-    "request": {
-      "agent_id": "triage-ai",
-      "intent": "gather_logs",
-      "env": "test",
-      "target": "host01",
-      "command": "gather_logs",
-      "reason": "smoke test",
-      "risk_level": "medium"
-    },
-    "status": "approved",
-    "require_approval": false,
-    "decision_by": "human_01",
-    "decision_at": "2025-12-19T08:05:12.1437874Z",
-    "decision": "approved",
-    "comment": "safe to execute",
-    "executed": true
-  },
-  {
-    "id": 5,
-    "request": {
-      "agent_id": "triage-ai",
-      "intent": "gather_logs",
-      "env": "test",
-      "target": "host01",
-      "command": "gather_logs",
-      "reason": "smoke test",
-      "risk_level": "medium"
-    },
-    "status": "approved",
-    "require_approval": false,
-    "decision_by": "human_01",
-    "decision_at": "2025-12-19T09:08:51.0084923Z",
-    "decision": "approved",
-    "comment": "safe to execute",
+    "comment": "approved",
     "executed": true
   }
 ]

@@ -1,17 +1,14 @@
-
 {
-
-"agent_id": "test-ai",
-
-"intent": "delete_dir",
-
-"target": "C:\\temp\\gate-test",
-
-"command": "rmdir /s /q C:\\temp\\gate-test",
-
-"reason": "test block",
-
-"risk_level": "high"
-
+  "agent_id": "claude-code",
+  "source": "claude-code",
+  "plan": [
+    "Clean up temporary test directory",
+    "Remove leftover artifacts after test execution",
+    "Ensure no impact on production systems"
+  ],
+  "intent": "delete_dir",
+  "target": "C:\\temp\\gate-test",
+  "command": "rmdir /s /q C:\\temp\\gate-test",
+  "reason": "cleanup after test",
+  "risk_level": "high"
 }
-

@@ -1,6 +1,12 @@
 
 
 # Gate
+Gate prevents AI agents from executing high-risk actions
+without explicit human approval and audit logs.
+
+AI can propose actions.
+Humans (or policies) decide.
+Gate is the only component that executes.
 > **Vision & Standard:** Gate is part of a larger architecture for enterprise AI agent governance.  
 > Read our [VISION.md](./VISION.md) for the core principles of the Gate execution model.
 

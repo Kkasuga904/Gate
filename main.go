@@ -1,21 +1,29 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"gopkg.in/yaml.v3"
 )
 
@@ -34,11 +42,28 @@ const (
 )
 
 const (
-	demoIntent      = "delete_dir"
-	demoTarget      = "C:\\temp\\gate-test"
-	demoRisk        = "high"
-	demoCommandLine = "rmdir /s /q C:\\temp\\gate-test"
-	demoCmdPath     = "C:\\Windows\\System32\\cmd.exe"
+	policyActionDeny            = "deny"
+	policyActionRequireApproval = "require_approval"
+	policyActionAllow           = "allow"
+)
+
+const (
+	policyDecisionDenied   = "policy_denied"
+	policyDecisionApproved = "policy_approved"
+)
+
+const (
+	reasonDenyCommand       = "DENY_COMMAND"
+	reasonDenyCapability    = "DENY_CAPABILITY"
+	reasonDenyOperation     = "DENY_OPERATION"
+	reasonDenyPath          = "DENY_PATH"
+	reasonRequireCommand    = "REQAPPROVAL_COMMAND"
+	reasonRequireCapability = "REQAPPROVAL_CAPABILITY"
+	reasonRequireOperation  = "REQAPPROVAL_OPERATION"
+	reasonAllowPath         = "ALLOW_PATH"
+	reasonDefaultDeny       = "DEFAULT_DENY"
+	reasonDefaultRequire    = "DEFAULT_REQUIRE_APPROVAL"
+	reasonDefaultAllow      = "DEFAULT_ALLOW"
 )
 
 var allowedRisks = map[string]struct{}{
@@ -47,45 +72,102 @@ var allowedRisks = map[string]struct{}{
 	"high":   {},
 }
 
-type executionRequest struct {
-	AgentID   string `json:"agent_id"`
-	Intent    string `json:"intent"`
-	Env       string `json:"env"`
-	Target    string `json:"target"`
-	Command   string `json:"command"`
-	Reason    string `json:"reason"`
-	RiskLevel string `json:"risk_level"`
+var riskRank = map[string]int{
+	"low":    1,
+	"medium": 2,
+	"high":   3,
 }
 
-type Request = executionRequest
+// statusOutput routes human-facing status lines; MCP mode overrides it to stderr.
+var statusOutput io.Writer = os.Stdout
 
-func demoAllowWithApproval(req Request) bool {
-	return req.Intent == "delete_dir"
+var globalDenySubstrings = []string{
+	"rm -rf",
+	"mkfs",
+	"dd if=",
+	"| bash",
+	"| sh",
+	"invoke-expression",
+	"iex ",
+	"kubectl delete",
+	"helm uninstall",
+}
+
+type capabilityPolicy struct {
+	AllowedBins     []string
+	AllowedSub      map[string]bool
+	DenyArgs        []string
+	RequireKeys     []string
+	MinRiskByTarget map[string]string
+}
+
+var capabilityPolicies = map[string]capabilityPolicy{
+	"terraform_plan": {
+		AllowedBins: []string{"terraform"},
+		AllowedSub: map[string]bool{
+			"plan": true,
+		},
+		DenyArgs:        []string{"-destroy", "-auto-approve"},
+		RequireKeys:     []string{"WORKDIR"},
+		MinRiskByTarget: map[string]string{"prod": "high"},
+	},
+	"kubectl_diff": {
+		AllowedBins: []string{"kubectl"},
+		AllowedSub: map[string]bool{
+			"diff": true,
+		},
+		RequireKeys:     []string{"KUBECONTEXT"},
+		MinRiskByTarget: map[string]string{"prod": "high"},
+	},
+}
+
+type executionRequest struct {
+	AgentID    string            `json:"agent_id"`
+	Intent     string            `json:"intent"`
+	Env        string            `json:"env"`
+	Target     string            `json:"target"`
+	Command    string            `json:"command"`
+	Reason     string            `json:"reason"`
+	RiskLevel  string            `json:"risk_level"`
+	Resources  []string          `json:"resources,omitempty"`
+	Operation  string            `json:"operation,omitempty"`
+	Capability string            `json:"capability,omitempty"`
+	Params     map[string]string `json:"params,omitempty"`
 }
 
 type requestRecord struct {
-	ID              int              `json:"id"`
-	Request         executionRequest `json:"request"`
-	Status          string           `json:"status"`
-	RequireApproval bool             `json:"-"`
-	DecisionBy      string           `json:"decision_by,omitempty"`
-	DecisionAt      *time.Time       `json:"decision_at,omitempty"`
-	Decision        string           `json:"decision,omitempty"`
-	Comment         string           `json:"comment,omitempty"`
-	Executed        bool             `json:"executed"`
-	ExecutionError  string           `json:"-"`
-	CreatedAt       time.Time        `json:"-"`
-}
-
-type policyRule struct {
-	Intent          string `yaml:"intent"`
-	Env             string `yaml:"env"`
-	RequireApproval bool   `yaml:"require_approval"`
-	Allow           *bool  `yaml:"allow"`
+	ID                 int              `json:"id"`
+	Request            executionRequest `json:"request"`
+	Status             string           `json:"status"`
+	RequireApproval    bool             `json:"require_approval"`
+	PolicyAction       string           `json:"policy_action,omitempty"`
+	PolicyReasonCode   string           `json:"policy_reason_code,omitempty"`
+	PolicyReasonDetail string           `json:"policy_reason_detail,omitempty"`
+	DecisionBy         string           `json:"decision_by,omitempty"`
+	DecisionAt         *time.Time       `json:"decision_at,omitempty"`
+	Decision           string           `json:"decision,omitempty"`
+	Comment            string           `json:"comment,omitempty"`
+	LastReviewBy       string           `json:"last_review_by,omitempty"`
+	LastReviewAt       *time.Time       `json:"last_review_at,omitempty"`
+	LastReviewDecision string           `json:"last_review_decision,omitempty"`
+	LastReviewComment  string           `json:"last_review_comment,omitempty"`
+	Executed           bool             `json:"executed"`
+	ExecutionError     string           `json:"-"`
+	CreatedAt          time.Time        `json:"-"`
 }
 
 type policyConfig struct {
-	Rules []policyRule `yaml:"rules"`
+	Version                     string   `yaml:"version"`
+	DefaultAction               string   `yaml:"default_action"`
+	AllowPaths                  []string `yaml:"allow_paths"`
+	DenyPaths                   []string `yaml:"deny_paths"`
+	DenyCommands                []string `yaml:"deny_commands"`
+	RequireApprovalCommands     []string `yaml:"require_approval_commands"`
+	DenyCapabilities            []string `yaml:"deny_capabilities,omitempty"`
+	RequireApprovalCapabilities []string `yaml:"require_approval_capabilities,omitempty"`
+	DenyOperations              []string `yaml:"deny_operations"`
+	RequireApprovalOperations   []string `yaml:"require_approval_operations"`
+	ApproverAllowlist           []string `yaml:"approver_allowlist"`
 }
 
 type allowlist struct {
@@ -93,20 +175,98 @@ type allowlist struct {
 }
 
 type allowedCommand struct {
-	Name string   `yaml:"name"`
-	Path string   `yaml:"path"`
-	Args []string `yaml:"args"`
+	Name string             `yaml:"name"`
+	Path string             `yaml:"path"`
+	Args []string           `yaml:"args"`
+	Vars map[string]varRule `yaml:"vars,omitempty"`
+}
+
+type varRule struct {
+	Pattern string `yaml:"pattern"`
+}
+
+type requestParamError struct {
+	Param   string
+	Reason  string
+	Pattern string
+}
+
+type policyValidationError struct {
+	Message string
+}
+
+func (e policyValidationError) Error() string {
+	return e.Message
+}
+
+type requestContextError struct {
+	RequestID  int
+	Capability string
+	Err        error
+}
+
+func (e requestContextError) Error() string {
+	capability := e.Capability
+	if strings.TrimSpace(capability) == "" {
+		capability = "unknown"
+	}
+	return fmt.Sprintf("%s [request_id=%d capability=%s]", e.Err.Error(), e.RequestID, capability)
+}
+
+func (e requestContextError) Unwrap() error {
+	return e.Err
+}
+
+func (e requestParamError) Error() string {
+	switch e.Reason {
+	case "missing":
+		return fmt.Sprintf("missing request param %s (required by allowlist)", e.Param)
+	case "policy_missing":
+		return fmt.Sprintf("missing request param %s (required by policy)", e.Param)
+	case "not_allowed":
+		return fmt.Sprintf("request param %s not allowed by allowlist", e.Param)
+	case "pattern":
+		if e.Pattern != "" {
+			return fmt.Sprintf("request param %s does not match allowlist pattern %q", e.Param, e.Pattern)
+		}
+		return fmt.Sprintf("request param %s does not match allowlist pattern", e.Param)
+	default:
+		return fmt.Sprintf("invalid request param %s", e.Param)
+	}
 }
 
 type auditEntry struct {
-	RequestID  int    `json:"request_id"`
-	AgentID    string `json:"agent_id"`
-	Intent     string `json:"intent"`
-	ApprovedBy string `json:"approved_by"`
-	Decision   string `json:"decision"`
-	Executed   bool   `json:"executed"`
-	Timestamp  string `json:"timestamp"`
-	Comment    string `json:"comment"`
+	RequestID          int    `json:"request_id"`
+	AgentID            string `json:"agent_id"`
+	Intent             string `json:"intent"`
+	ApprovedBy         string `json:"approved_by"`
+	Decision           string `json:"decision"`
+	Executed           bool   `json:"executed"`
+	Timestamp          string `json:"timestamp"`
+	Comment            string `json:"comment"`
+	PolicyAction       string `json:"policy_action,omitempty"`
+	PolicyReasonCode   string `json:"policy_reason_code,omitempty"`
+	PolicyReasonDetail string `json:"policy_reason_detail,omitempty"`
+}
+
+type jsonrpcRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+type jsonrpcResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Result  interface{}     `json:"result,omitempty"`
+	Error   *jsonrpcError   `json:"error,omitempty"`
+}
+
+type jsonrpcError struct {
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
 }
 
 func main() {
@@ -124,6 +284,9 @@ func main() {
 		return
 	case "deny":
 		handleDenyCLI()
+		return
+	case "mcp":
+		startMCPServer()
 		return
 	case "help", "-h", "--help":
 		printUsage()
@@ -158,6 +321,545 @@ func startServer() {
 	}
 }
 
+func startMCPServer() {
+	log.SetOutput(os.Stderr)
+	log.SetPrefix("")
+	statusOutput = os.Stderr
+	log.Println("Gate MCP server listening on stdio")
+	reader := bufio.NewReader(os.Stdin)
+	writer := bufio.NewWriter(os.Stdout)
+
+	for {
+		payload, err := readRPCMessage(reader)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "mcp read error: %v\n", err)
+			return
+		}
+
+		var req jsonrpcRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			_ = writeRPCResponse(writer, jsonrpcResponse{
+				JSONRPC: "2.0",
+				Error: &jsonrpcError{
+					Code:    -32600,
+					Message: "invalid request",
+				},
+			})
+			continue
+		}
+
+		if len(req.ID) == 0 {
+			_ = handleMCPRequest(req)
+			continue
+		}
+
+		resp := handleMCPRequest(req)
+		if resp != nil {
+			_ = writeRPCResponse(writer, *resp)
+		}
+	}
+}
+
+func readRPCMessage(reader *bufio.Reader) ([]byte, error) {
+	var contentLength int
+	seenNonBlankHeaderLine := false
+	seenContentLength := false
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		if errors.Is(err, io.EOF) && len(line) == 0 {
+			if !seenNonBlankHeaderLine {
+				return nil, io.EOF
+			}
+			return nil, fmt.Errorf("missing Content-Length")
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if strings.TrimSpace(line) == "" {
+			if !seenNonBlankHeaderLine {
+				if errors.Is(err, io.EOF) {
+					return nil, io.EOF
+				}
+				continue
+			}
+			break
+		}
+		seenNonBlankHeaderLine = true
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(parts[0]), "Content-Length") {
+			length, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+			if err != nil {
+				return nil, fmt.Errorf("invalid Content-Length")
+			}
+			contentLength = length
+			seenContentLength = true
+		}
+		if errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("missing Content-Length")
+		}
+	}
+
+	if !seenContentLength || contentLength <= 0 {
+		return nil, fmt.Errorf("missing Content-Length")
+	}
+
+	payload := make([]byte, contentLength)
+	if _, err := io.ReadFull(reader, payload); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return nil, err
+	}
+	return payload, nil
+}
+
+func writeRPCResponse(writer *bufio.Writer, resp jsonrpcResponse) error {
+	if resp.JSONRPC == "" {
+		resp.JSONRPC = "2.0"
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return err
+	}
+	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(data))
+	if _, err := writer.WriteString(header); err != nil {
+		return err
+	}
+	if _, err := writer.Write(data); err != nil {
+		return err
+	}
+	return writer.Flush()
+}
+
+func handleMCPRequest(req jsonrpcRequest) *jsonrpcResponse {
+	switch req.Method {
+	case "initialize":
+		result := map[string]interface{}{
+			"protocolVersion": "2024-11-05",
+			"serverInfo": map[string]string{
+				"name":    "Gate",
+				"version": "0.1",
+			},
+			"capabilities": map[string]interface{}{
+				"tools": map[string]interface{}{},
+			},
+		}
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
+	case "gate.execute_request":
+		var args mcpExecuteRequestArgs
+		if err := json.Unmarshal(req.Params, &args); err != nil {
+			return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonrpcError{Code: -32602, Message: "invalid execute_request params"}}
+		}
+		result, err := submitExecutionRequest(executionRequest{
+			AgentID:    args.AgentID,
+			Intent:     args.Intent,
+			Target:     args.Target,
+			Command:    args.Command,
+			Reason:     args.Reason,
+			RiskLevel:  args.RiskLevel,
+			Capability: args.Capability,
+			Params:     args.Params,
+		})
+		if err != nil {
+			return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonrpcError{Code: -32603, Message: err.Error()}}
+		}
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
+	case "gate.approve":
+		args, rpcErr := parseReviewArgs(req.Params)
+		if rpcErr != nil {
+			return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: rpcErr}
+		}
+		if err := approveRequest(args.RequestID, args.User, args.Comment); err != nil {
+			code := -32603
+			var paramErr requestParamError
+			var policyErr policyValidationError
+			if errors.As(err, &paramErr) || errors.As(err, &policyErr) {
+				code = -32602
+			}
+			return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonrpcError{Code: code, Message: err.Error()}}
+		}
+		result := map[string]interface{}{
+			"request_id": args.RequestID,
+			"status":     statusApproved,
+		}
+		if rec, err := findRequestRecord(args.RequestID); err == nil {
+			result["executed"] = rec.Executed
+			if rec.ExecutionError != "" {
+				result["execution_error"] = rec.ExecutionError
+			}
+			if rec.Executed {
+				result["output_file"] = outputFilePath(rec.ID)
+			}
+		}
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
+	case "gate.deny":
+		args, rpcErr := parseReviewArgs(req.Params)
+		if rpcErr != nil {
+			return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: rpcErr}
+		}
+		if err := denyRequest(args.RequestID, args.User, args.Comment); err != nil {
+			return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonrpcError{Code: -32603, Message: err.Error()}}
+		}
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]interface{}{
+			"request_id": args.RequestID,
+			"status":     statusDenied,
+		}}
+	case "gate.list_capabilities":
+		caps, err := listCapabilities()
+		if err != nil {
+			return &jsonrpcResponse{
+				JSONRPC: "2.0",
+				ID:      req.ID,
+				Error: &jsonrpcError{
+					Code:    -32603,
+					Message: err.Error(),
+				},
+			}
+		}
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]interface{}{
+			"capabilities": caps,
+		}}
+	case "tools/list":
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]interface{}{
+			"tools": mcpToolDefinitions(),
+		}}
+	case "tools/call":
+		result, rpcErr := handleMCPToolCall(req.Params)
+		if rpcErr != nil {
+			return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: rpcErr}
+		}
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
+	default:
+		return &jsonrpcResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error: &jsonrpcError{
+				Code:    -32601,
+				Message: "method not found",
+			},
+		}
+	}
+}
+
+func mcpToolDefinitions() []map[string]interface{} {
+	return []map[string]interface{}{
+		{
+			"name":        "gate.execute_request",
+			"description": "Submit an execution request to Gate.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"agent_id": map[string]interface{}{
+						"type": "string",
+					},
+					"intent": map[string]interface{}{
+						"type": "string",
+					},
+					"target": map[string]interface{}{
+						"type": "string",
+					},
+					"command": map[string]interface{}{
+						"type": "string",
+					},
+					"reason": map[string]interface{}{
+						"type": "string",
+					},
+					"risk_level": map[string]interface{}{
+						"type": "string",
+						"enum": []string{"low", "medium", "high"},
+					},
+					"capability": map[string]interface{}{
+						"type": "string",
+					},
+					"params": map[string]interface{}{
+						"type":                 "object",
+						"additionalProperties": map[string]interface{}{"type": "string"},
+					},
+				},
+				"required": []string{"agent_id", "intent", "target", "command", "reason", "risk_level"},
+			},
+		},
+		{
+			"name":        "gate.approve",
+			"description": "Approve and execute a pending request.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"request_id": map[string]interface{}{
+						"type": "integer",
+					},
+					"user": map[string]interface{}{
+						"type": "string",
+					},
+					"comment": map[string]interface{}{
+						"type": "string",
+					},
+				},
+				"required": []string{"request_id", "user", "comment"},
+			},
+		},
+		{
+			"name":        "gate.deny",
+			"description": "Deny a pending request.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"request_id": map[string]interface{}{
+						"type": "integer",
+					},
+					"user": map[string]interface{}{
+						"type": "string",
+					},
+					"comment": map[string]interface{}{
+						"type": "string",
+					},
+				},
+				"required": []string{"request_id", "user", "comment"},
+			},
+		},
+		{
+			"name":        "gate.list_capabilities",
+			"description": "List allowlisted capabilities.",
+			"inputSchema": map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		},
+	}
+}
+
+type mcpToolCallParams struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+type mcpExecuteRequestArgs struct {
+	AgentID    string            `json:"agent_id"`
+	Intent     string            `json:"intent"`
+	Target     string            `json:"target"`
+	Command    string            `json:"command"`
+	Reason     string            `json:"reason"`
+	RiskLevel  string            `json:"risk_level"`
+	Capability string            `json:"capability,omitempty"`
+	Params     map[string]string `json:"params,omitempty"`
+}
+
+type mcpReviewArgs struct {
+	RequestID int    `json:"request_id"`
+	User      string `json:"user"`
+	Comment   string `json:"comment"`
+}
+
+func parseReviewArgs(raw json.RawMessage) (mcpReviewArgs, *jsonrpcError) {
+	var args mcpReviewArgs
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return args, &jsonrpcError{Code: -32602, Message: "invalid params"}
+	}
+
+	if strings.TrimSpace(args.Comment) == "" {
+		var rawMap map[string]interface{}
+		if err := json.Unmarshal(raw, &rawMap); err == nil {
+			if val := readStringParam(rawMap, "TEXT"); val != "" {
+				args.Comment = val
+			} else if val := readStringParam(rawMap, "text"); val != "" {
+				args.Comment = val
+			}
+		}
+	}
+
+	if args.RequestID == 0 {
+		return args, &jsonrpcError{Code: -32602, Message: "missing param request_id"}
+	}
+	if strings.TrimSpace(args.User) == "" {
+		return args, &jsonrpcError{Code: -32602, Message: "missing param user"}
+	}
+	if strings.TrimSpace(args.Comment) == "" {
+		return args, &jsonrpcError{Code: -32602, Message: "missing param comment"}
+	}
+	return args, nil
+}
+
+func readStringParam(raw map[string]interface{}, key string) string {
+	if raw == nil {
+		return ""
+	}
+	val, ok := raw[key]
+	if !ok {
+		return ""
+	}
+	str, ok := val.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(str)
+}
+
+func annotateRequestError(rec requestRecord, err error) error {
+	var paramErr requestParamError
+	if errors.As(err, &paramErr) {
+		return requestContextError{
+			RequestID:  rec.ID,
+			Capability: rec.Request.Capability,
+			Err:        paramErr,
+		}
+	}
+	var policyErr policyValidationError
+	if errors.As(err, &policyErr) {
+		return requestContextError{
+			RequestID:  rec.ID,
+			Capability: rec.Request.Capability,
+			Err:        policyErr,
+		}
+	}
+	return err
+}
+
+func handleMCPToolCall(raw json.RawMessage) (interface{}, *jsonrpcError) {
+	var call mcpToolCallParams
+	if err := json.Unmarshal(raw, &call); err != nil {
+		return nil, &jsonrpcError{Code: -32602, Message: "invalid params"}
+	}
+
+	switch call.Name {
+	case "gate.execute_request":
+		var args mcpExecuteRequestArgs
+		if err := json.Unmarshal(call.Arguments, &args); err != nil {
+			return nil, &jsonrpcError{Code: -32602, Message: "invalid execute_request args"}
+		}
+		req := executionRequest{
+			AgentID:    args.AgentID,
+			Intent:     args.Intent,
+			Target:     args.Target,
+			Command:    args.Command,
+			Reason:     args.Reason,
+			RiskLevel:  args.RiskLevel,
+			Capability: args.Capability,
+			Params:     args.Params,
+		}
+		result, err := submitExecutionRequest(req)
+		if err != nil {
+			return nil, &jsonrpcError{Code: -32602, Message: err.Error()}
+		}
+		return result, nil
+	case "gate.approve":
+		args, rpcErr := parseReviewArgs(call.Arguments)
+		if rpcErr != nil {
+			return nil, rpcErr
+		}
+		if err := approveRequest(args.RequestID, args.User, args.Comment); err != nil {
+			code := -32603
+			var paramErr requestParamError
+			var policyErr policyValidationError
+			if errors.As(err, &paramErr) || errors.As(err, &policyErr) {
+				code = -32602
+			}
+			return nil, &jsonrpcError{Code: code, Message: err.Error()}
+		}
+		result := map[string]interface{}{
+			"request_id": args.RequestID,
+			"status":     statusApproved,
+		}
+		if rec, err := findRequestRecord(args.RequestID); err == nil {
+			result["executed"] = rec.Executed
+			if rec.ExecutionError != "" {
+				result["execution_error"] = rec.ExecutionError
+			}
+			if rec.Executed {
+				result["output_file"] = outputFilePath(rec.ID)
+			}
+		}
+		return result, nil
+	case "gate.deny":
+		args, rpcErr := parseReviewArgs(call.Arguments)
+		if rpcErr != nil {
+			return nil, rpcErr
+		}
+		if err := denyRequest(args.RequestID, args.User, args.Comment); err != nil {
+			return nil, &jsonrpcError{Code: -32603, Message: err.Error()}
+		}
+		return map[string]interface{}{
+			"request_id": args.RequestID,
+			"status":     statusDenied,
+		}, nil
+	case "gate.list_capabilities":
+		caps, err := listCapabilities()
+		if err != nil {
+			return nil, &jsonrpcError{Code: -32603, Message: err.Error()}
+		}
+		return map[string]interface{}{
+			"capabilities": caps,
+		}, nil
+	default:
+		return nil, &jsonrpcError{Code: -32601, Message: "tool not found"}
+	}
+}
+
+func submitExecutionRequest(req executionRequest) (map[string]interface{}, error) {
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	httpReq := httptest.NewRequest(http.MethodPost, "/execution/request", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+	handleExecutionRequest(rec, httpReq)
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var parsed map[string]interface{}
+	if len(body) > 0 && json.Unmarshal(body, &parsed) == nil {
+		if _, ok := parsed["request_id"]; ok {
+			return parsed, nil
+		}
+	}
+
+	msg := strings.TrimSpace(string(body))
+	if msg == "" {
+		msg = fmt.Sprintf("request failed with status %d", resp.StatusCode)
+	}
+	return nil, fmt.Errorf(msg)
+}
+
+func findRequestRecord(id int) (requestRecord, error) {
+	records, err := loadRequests()
+	if err != nil {
+		return requestRecord{}, err
+	}
+	for _, rec := range records {
+		if rec.ID == id {
+			return rec, nil
+		}
+	}
+	return requestRecord{}, fmt.Errorf("request %d not found", id)
+}
+
+func outputFilePath(id int) string {
+	return filepath.Join(outputsDir, fmt.Sprintf("request-%d.txt", id))
+}
+
+func listCapabilities() ([]string, error) {
+	cfg, err := loadAllowlist(allowlistFile)
+	if err != nil {
+		return nil, err
+	}
+	caps := make([]string, 0, len(cfg.Commands))
+	for _, cmd := range cfg.Commands {
+		caps = append(caps, cmd.Name)
+	}
+	return caps, nil
+}
+
 func printUsage() {
 	exe := filepath.Base(os.Args[0])
 	fmt.Fprintf(os.Stderr, "Usage:\n")
@@ -165,6 +867,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  %s submit <request.json>\n", exe)
 	fmt.Fprintf(os.Stderr, "  %s approve --request-id <id> --user <user> --comment <text>\n", exe)
 	fmt.Fprintf(os.Stderr, "  %s deny --request-id <id> --user <user> --comment <text>\n", exe)
+	fmt.Fprintf(os.Stderr, "  %s mcp\n", exe)
 }
 
 func isAddrAlreadyInUse(err error) bool {
@@ -206,7 +909,7 @@ func handleExecutionRequest(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(name) == "" {
 		name = req.Command
 	}
-	fmt.Printf("New request received: %s (Risk: %s)\n", name, strings.ToUpper(req.RiskLevel))
+	fmt.Fprintf(statusOutput, "New request received: %s (Risk: %s)\n", name, strings.ToUpper(req.RiskLevel))
 
 	policyCfg, err := loadPolicy(policyFile)
 	if err != nil {
@@ -214,135 +917,349 @@ func handleExecutionRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	decision := evaluatePolicy(req, policyCfg)
+	policyResult := evaluatePolicy(req, policyCfg)
 	now := time.Now().UTC()
 	rec := requestRecord{
-		ID:              nextRequestID(),
-		Request:         req,
-		Status:          statusPending,
-		RequireApproval: decision.requireApproval,
-		CreatedAt:       now,
+		ID:                 nextRequestID(),
+		Request:            req,
+		Status:             statusPending,
+		RequireApproval:    policyResult.Action == policyActionRequireApproval,
+		PolicyAction:       policyResult.Action,
+		PolicyReasonCode:   policyResult.ReasonCode,
+		PolicyReasonDetail: policyResult.ReasonDetail,
+		CreatedAt:          now,
 	}
 
-	if !decision.allowed {
+	switch policyResult.Action {
+	case policyActionDeny:
 		rec.Status = statusDenied
-		rec.Decision = statusDenied
+		rec.Decision = policyDecisionDenied
 		rec.DecisionBy = "policy"
 		rec.DecisionAt = &now
-		rec.Comment = decision.reason
-		appendAudit(rec.ID, req.AgentID, req.Intent, "policy", statusDenied, false, decision.reason)
+		rec.Comment = policyResult.ReasonCode
+		appendAudit(rec.ID, req.AgentID, req.Intent, "policy", policyDecisionDenied, false, policyResult.ReasonCode, rec.PolicyAction, rec.PolicyReasonCode, rec.PolicyReasonDetail)
 		if err := persistRequest(rec); err != nil {
 			http.Error(w, "failed to persist request", http.StatusInternalServerError)
 			return
 		}
 		writeJSON(w, http.StatusForbidden, map[string]interface{}{
-			"request_id": rec.ID,
-			"status":     statusDenied,
-			"reason":     decision.reason,
+			"request_id":    rec.ID,
+			"status":        statusDenied,
+			"executed":      false,
+			"reason":        policyResult.ReasonCode,
+			"policy_result": policyResult,
 		})
 		return
-	}
-
-	if decision.comment != "" {
+	case policyActionAllow:
+		rec.Status = statusApproved
+		rec.Decision = policyDecisionApproved
 		rec.DecisionBy = "policy"
-		rec.Decision = statusPending
-		rec.Comment = decision.comment
-	}
+		rec.DecisionAt = &now
+		rec.Comment = policyResult.ReasonCode
+		rec.RequireApproval = false
 
-	if err := persistRequest(rec); err != nil {
-		http.Error(w, "failed to persist request", http.StatusInternalServerError)
+		cmdDef, resolveErr := resolveAllowedCommand(rec.Request)
+		if resolveErr != nil {
+			rec.ExecutionError = annotateRequestError(rec, resolveErr).Error()
+		} else {
+			_ = executeForRecord(&rec, cmdDef)
+		}
+
+		if err := persistRequest(rec); err != nil {
+			http.Error(w, "failed to persist request", http.StatusInternalServerError)
+			return
+		}
+		appendAudit(rec.ID, req.AgentID, req.Intent, "policy", policyDecisionApproved, rec.Executed, policyResult.ReasonCode, rec.PolicyAction, rec.PolicyReasonCode, rec.PolicyReasonDetail)
+
+		payload := map[string]interface{}{
+			"request_id":       rec.ID,
+			"status":           rec.Status,
+			"require_approval": false,
+			"executed":         rec.Executed,
+			"policy_result":    policyResult,
+		}
+		if rec.ExecutionError != "" {
+			payload["execution_error"] = rec.ExecutionError
+		}
+		writeJSON(w, http.StatusOK, payload)
+		return
+	case policyActionRequireApproval:
+		rec.Status = statusPending
+		rec.RequireApproval = true
+		if err := persistRequest(rec); err != nil {
+			http.Error(w, "failed to persist request", http.StatusInternalServerError)
+			return
+		}
+		appendAudit(rec.ID, req.AgentID, req.Intent, "policy", policyActionRequireApproval, false, policyResult.ReasonCode, rec.PolicyAction, rec.PolicyReasonCode, rec.PolicyReasonDetail)
+		writeJSON(w, http.StatusAccepted, map[string]interface{}{
+			"request_id":       rec.ID,
+			"status":           statusPending,
+			"require_approval": true,
+			"executed":         false,
+			"message":          "awaiting human approval via CLI",
+			"policy_result":    policyResult,
+		})
+		return
+	default:
+		http.Error(w, "policy evaluation failure", http.StatusInternalServerError)
 		return
 	}
+}
 
-	msg := "awaiting human approval via CLI"
-	if !rec.RequireApproval {
-		msg = "policy allowed; manual release still required via CLI"
+type policyResult struct {
+	Action       string `json:"action"`
+	ReasonCode   string `json:"reason_code"`
+	ReasonDetail string `json:"reason_detail"`
+}
+
+func evaluatePolicy(req executionRequest, cfg policyConfig) policyResult {
+	normalizedCmd := normalizeCommand(req.Command)
+	operation := strings.TrimSpace(req.Operation)
+	if operation == "" {
+		operation = req.Intent
 	}
-	writeJSON(w, http.StatusAccepted, map[string]interface{}{
-		"request_id":       rec.ID,
-		"status":           statusPending,
-		"require_approval": rec.RequireApproval,
-		"message":          msg,
-	})
-}
+	operation = strings.ToLower(operation)
+	capability := strings.TrimSpace(req.Capability)
+	resources := resolveResources(req)
 
-type policyDecision struct {
-	allowed         bool
-	requireApproval bool
-	reason          string
-	comment         string
-}
-
-func evaluatePolicy(req executionRequest, cfg policyConfig) policyDecision {
-	for _, rule := range cfg.Rules {
-		if rule.Intent != req.Intent {
-			continue
+	if pattern := matchAnyCapability(capability, cfg.DenyCapabilities); pattern != "" {
+		return policyResult{
+			Action:       policyActionDeny,
+			ReasonCode:   reasonDenyCapability,
+			ReasonDetail: fmt.Sprintf("capability matched deny_capabilities entry %q", pattern),
 		}
-		if rule.Env != "" && rule.Env != req.Env {
-			continue
-		}
+	}
 
-		decision := policyDecision{
-			allowed:         true,
-			requireApproval: rule.RequireApproval,
+	if pattern := matchAnyCapability(capability, cfg.RequireApprovalCapabilities); pattern != "" {
+		return policyResult{
+			Action:       policyActionRequireApproval,
+			ReasonCode:   reasonRequireCapability,
+			ReasonDetail: fmt.Sprintf("capability matched require_approval_capabilities entry %q", pattern),
 		}
+	}
 
-		if rule.Allow != nil {
-			decision.allowed = *rule.Allow
+	if pattern := matchAnyCommand(normalizedCmd, cfg.DenyCommands); pattern != "" {
+		return policyResult{
+			Action:       policyActionDeny,
+			ReasonCode:   reasonDenyCommand,
+			ReasonDetail: fmt.Sprintf("command matched deny_commands pattern %q", pattern),
 		}
+	}
 
-		if req.RiskLevel == "high" {
-			decision.requireApproval = true
-			if rule.Allow != nil && !*rule.Allow {
-				decision.reason = "high risk intent blocked by policy"
-				decision.allowed = false
+	if pattern := matchAnyOperation(operation, cfg.DenyOperations); pattern != "" {
+		return policyResult{
+			Action:       policyActionDeny,
+			ReasonCode:   reasonDenyOperation,
+			ReasonDetail: fmt.Sprintf("operation matched deny_operations entry %q", pattern),
+		}
+	}
+
+	if len(resources) > 0 {
+		if res, pattern := matchAnyPath(resources, cfg.DenyPaths); pattern != "" {
+			return policyResult{
+				Action:       policyActionDeny,
+				ReasonCode:   reasonDenyPath,
+				ReasonDetail: fmt.Sprintf("resource %q matched deny_paths pattern %q", res, pattern),
 			}
 		}
-
-		if !decision.allowed && decision.reason == "" {
-			decision.reason = "blocked by policy"
-		}
-		if decision.requireApproval && decision.reason == "" {
-			decision.reason = "approval required"
-		}
-
-		return decision
 	}
 
-	if demoAllowWithApproval(req) {
-		return policyDecision{
-			allowed:         true,
-			requireApproval: true,
-			comment:         "requires human approval (demo rule)",
+	if pattern := matchAnyCommand(normalizedCmd, cfg.RequireApprovalCommands); pattern != "" {
+		return policyResult{
+			Action:       policyActionRequireApproval,
+			ReasonCode:   reasonRequireCommand,
+			ReasonDetail: fmt.Sprintf("command matched require_approval_commands pattern %q", pattern),
 		}
 	}
 
-	return policyDecision{
-		allowed:         false,
-		requireApproval: true,
-		reason:          "no matching policy rule",
+	if pattern := matchAnyOperation(operation, cfg.RequireApprovalOperations); pattern != "" {
+		return policyResult{
+			Action:       policyActionRequireApproval,
+			ReasonCode:   reasonRequireOperation,
+			ReasonDetail: fmt.Sprintf("operation matched require_approval_operations entry %q", pattern),
+		}
+	}
+
+	defaultAction := normalizePolicyAction(cfg.DefaultAction)
+	if defaultAction == "" {
+		defaultAction = policyActionRequireApproval
+	}
+
+	if len(cfg.AllowPaths) > 0 && len(resources) > 0 {
+		if allPathsAllowed(resources, cfg.AllowPaths) {
+			if defaultAction == policyActionAllow {
+				return policyResult{
+					Action:       policyActionAllow,
+					ReasonCode:   reasonAllowPath,
+					ReasonDetail: "all resources match allow_paths",
+				}
+			}
+		} else if defaultAction == policyActionAllow {
+			return policyResult{
+				Action:       policyActionRequireApproval,
+				ReasonCode:   reasonDefaultRequire,
+				ReasonDetail: "default_action allow overridden; resources outside allow_paths",
+			}
+		}
+	}
+
+	switch defaultAction {
+	case policyActionAllow:
+		return policyResult{
+			Action:       policyActionAllow,
+			ReasonCode:   reasonDefaultAllow,
+			ReasonDetail: "default_action allow",
+		}
+	case policyActionDeny:
+		return policyResult{
+			Action:       policyActionDeny,
+			ReasonCode:   reasonDefaultDeny,
+			ReasonDetail: "default_action deny",
+		}
+	default:
+		return policyResult{
+			Action:       policyActionRequireApproval,
+			ReasonCode:   reasonDefaultRequire,
+			ReasonDetail: "default_action require_approval",
+		}
 	}
 }
 
-func isDemoException(req executionRequest) bool {
-	return req.Intent == demoIntent &&
-		req.Target == demoTarget &&
-		strings.EqualFold(req.RiskLevel, demoRisk)
+func normalizeCommand(cmd string) string {
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.ToLower(strings.Join(parts, " "))
 }
 
-func demoAllowedCommand(req executionRequest) (allowedCommand, bool) {
-	if !isDemoException(req) {
-		return allowedCommand{}, false
+func matchAnyCommand(command string, patterns []string) string {
+	for _, pattern := range patterns {
+		normalized := normalizeCommand(pattern)
+		if normalized == "" {
+			continue
+		}
+		if strings.HasPrefix(command, normalized) {
+			return pattern
+		}
 	}
-	if req.Command != demoCommandLine {
-		return allowedCommand{}, false
-	}
+	return ""
+}
 
-	return allowedCommand{
-		Name: demoIntent,
-		Path: demoCmdPath,
-		Args: []string{"/C", "rmdir", "/s", "/q", demoTarget},
-	}, true
+func matchAnyOperation(operation string, patterns []string) string {
+	for _, pattern := range patterns {
+		if strings.EqualFold(strings.TrimSpace(pattern), operation) {
+			return pattern
+		}
+	}
+	return ""
+}
+
+func matchAnyCapability(capability string, patterns []string) string {
+	if strings.TrimSpace(capability) == "" {
+		return ""
+	}
+	for _, pattern := range patterns {
+		if strings.EqualFold(strings.TrimSpace(pattern), capability) {
+			return pattern
+		}
+	}
+	return ""
+}
+
+func resolveResources(req executionRequest) []string {
+	if len(req.Resources) > 0 {
+		return append([]string{}, req.Resources...)
+	}
+	if isLikelyPath(req.Target) {
+		return []string{req.Target}
+	}
+	return nil
+}
+
+func isLikelyPath(target string) bool {
+	trimmed := strings.TrimSpace(target)
+	if trimmed == "" {
+		return false
+	}
+	if filepath.IsAbs(trimmed) {
+		return true
+	}
+	if strings.ContainsAny(trimmed, `/\`) {
+		return true
+	}
+	if strings.HasPrefix(trimmed, ".") || strings.HasPrefix(trimmed, "~") {
+		return true
+	}
+	if ext := filepath.Ext(trimmed); ext != "" && ext != "." {
+		return true
+	}
+	return false
+}
+
+func normalizePolicyAction(action string) string {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case policyActionAllow:
+		return policyActionAllow
+	case policyActionDeny:
+		return policyActionDeny
+	case policyActionRequireApproval:
+		return policyActionRequireApproval
+	default:
+		return ""
+	}
+}
+
+func matchAnyPath(resources []string, patterns []string) (string, string) {
+	for _, res := range resources {
+		for _, pattern := range patterns {
+			if matchPath(pattern, res) {
+				return res, pattern
+			}
+		}
+	}
+	return "", ""
+}
+
+func allPathsAllowed(resources []string, patterns []string) bool {
+	for _, res := range resources {
+		matched := false
+		for _, pattern := range patterns {
+			if matchPath(pattern, res) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return len(resources) > 0
+}
+
+func matchPath(pattern, path string) bool {
+	normalizedPattern := normalizePathForMatch(pattern)
+	normalizedPath := normalizePathForMatch(path)
+	if normalizedPattern == "" || normalizedPath == "" {
+		return false
+	}
+	ok, err := doublestar.Match(normalizedPattern, normalizedPath)
+	if err != nil {
+		return false
+	}
+	return ok
+}
+
+func normalizePathForMatch(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	normalized := filepath.ToSlash(trimmed)
+	if runtime.GOOS == "windows" {
+		normalized = strings.ToLower(normalized)
+	}
+	return normalized
 }
 
 func validateRequest(req executionRequest) error {
@@ -385,35 +1302,8 @@ func loadRequests() ([]requestRecord, error) {
 }
 
 func saveRequests(records []requestRecord) error {
-	type storedRecord struct {
-		ID              int              `json:"id"`
-		Request         executionRequest `json:"request"`
-		Status          string           `json:"status"`
-		RequireApproval bool             `json:"require_approval"`
-		DecisionBy      string           `json:"decision_by,omitempty"`
-		DecisionAt      *time.Time       `json:"decision_at,omitempty"`
-		Decision        string           `json:"decision,omitempty"`
-		Comment         string           `json:"comment,omitempty"`
-		Executed        bool             `json:"executed"`
-	}
-
-	stored := make([]storedRecord, 0, len(records))
-	for _, r := range records {
-		stored = append(stored, storedRecord{
-			ID:              r.ID,
-			Request:         r.Request,
-			Status:          r.Status,
-			RequireApproval: r.RequireApproval,
-			DecisionBy:      r.DecisionBy,
-			DecisionAt:      r.DecisionAt,
-			Decision:        r.Decision,
-			Comment:         r.Comment,
-			Executed:        r.Executed,
-		})
-	}
-
 	tmp := filepath.Join(filepath.Dir(requestsFile), fmt.Sprintf(".%s.tmp", filepath.Base(requestsFile)))
-	data, err := json.MarshalIndent(stored, "", "  ")
+	data, err := json.MarshalIndent(records, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -468,6 +1358,251 @@ func findAllowedCommand(name string, cfg allowlist) (allowedCommand, bool) {
 		}
 	}
 	return allowedCommand{}, false
+}
+
+func resolveAllowedCommand(req executionRequest) (allowedCommand, error) {
+	if err := validateAgainstPolicy(req); err != nil {
+		return allowedCommand{}, err
+	}
+	allowCfg, err := loadAllowlist(allowlistFile)
+	if err != nil {
+		return allowedCommand{}, fmt.Errorf("failed to load allowlist: %w", err)
+	}
+	key := strings.TrimSpace(req.Command)
+	if strings.TrimSpace(req.Capability) != "" {
+		key = strings.TrimSpace(req.Capability)
+	}
+
+	cmdDef, ok := findAllowedCommand(key, allowCfg)
+	if !ok {
+		if fallback, ok, err := resolveAllowedCommandFromPolicy(req); ok || err != nil {
+			return fallback, err
+		}
+		return allowedCommand{}, fmt.Errorf("requested command %q not in allowlist", key)
+	}
+
+	cmdDef, err = buildExecutableCommand(cmdDef, req.Params)
+	if err != nil {
+		return allowedCommand{}, err
+	}
+	return cmdDef, nil
+}
+
+func resolveAllowedCommandFromPolicy(req executionRequest) (allowedCommand, bool, error) {
+	capability := strings.ToLower(strings.TrimSpace(req.Capability))
+	if capability == "" {
+		return allowedCommand{}, false, nil
+	}
+	policy, ok := capabilityPolicies[capability]
+	if !ok {
+		return allowedCommand{}, false, nil
+	}
+	if len(policy.AllowedBins) == 0 {
+		return allowedCommand{}, true, policyValidationError{Message: "policy missing allowed binary"}
+	}
+
+	subcommand := selectPolicySubcommand(policy.AllowedSub)
+	if subcommand == "" {
+		return allowedCommand{}, true, policyValidationError{Message: "policy missing allowed subcommand"}
+	}
+
+	args := make([]string, 0, 4)
+	switch capability {
+	case "terraform_plan":
+		if workdir := strings.TrimSpace(req.Params["WORKDIR"]); workdir != "" {
+			args = append(args, fmt.Sprintf("-chdir=%s", workdir))
+		}
+	case "kubectl_diff":
+		if ctx := strings.TrimSpace(req.Params["KUBECONTEXT"]); ctx != "" {
+			args = append(args, "--context", ctx)
+		}
+	}
+	args = append(args, subcommand)
+
+	return allowedCommand{
+		Name: req.Capability,
+		Path: policy.AllowedBins[0],
+		Args: args,
+	}, true, nil
+}
+
+func selectPolicySubcommand(allowed map[string]bool) string {
+	if len(allowed) == 0 {
+		return ""
+	}
+	for _, preferred := range []string{"plan", "diff"} {
+		if allowed[preferred] {
+			return preferred
+		}
+	}
+	keys := make([]string, 0, len(allowed))
+	for key := range allowed {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys[0]
+}
+
+func buildExecutableCommand(cmdDef allowedCommand, params map[string]string) (allowedCommand, error) {
+	if len(cmdDef.Vars) == 0 {
+		return cmdDef, nil
+	}
+	if params == nil {
+		params = map[string]string{}
+	}
+
+	placeholderRe := regexp.MustCompile(`\{([A-Za-z0-9_]+)\}`)
+	replacedArgs := make([]string, len(cmdDef.Args))
+	checked := make(map[string]struct{})
+
+	for i, arg := range cmdDef.Args {
+		matches := placeholderRe.FindAllStringSubmatch(arg, -1)
+		for _, match := range matches {
+			name := match[1]
+			rule, ok := cmdDef.Vars[name]
+			if !ok {
+				return allowedCommand{}, requestParamError{Param: name, Reason: "not_allowed"}
+			}
+			value, ok := params[name]
+			if !ok {
+				return allowedCommand{}, requestParamError{Param: name, Reason: "missing"}
+			}
+			if _, seen := checked[name]; !seen {
+				if err := validateParam(name, value, rule); err != nil {
+					return allowedCommand{}, err
+				}
+				checked[name] = struct{}{}
+			}
+		}
+
+		replaced := arg
+		for _, match := range matches {
+			name := match[1]
+			replaced = strings.ReplaceAll(replaced, "{"+name+"}", params[name])
+		}
+		replacedArgs[i] = replaced
+	}
+
+	cmdDef.Args = replacedArgs
+	return cmdDef, nil
+}
+
+func validateParam(name, value string, rule varRule) error {
+	pattern := strings.TrimSpace(rule.Pattern)
+	if pattern == "" {
+		return nil
+	}
+	ok, err := regexp.MatchString(pattern, value)
+	if err != nil {
+		return fmt.Errorf("invalid pattern for %s", name)
+	}
+	if !ok {
+		return requestParamError{Param: name, Reason: "pattern", Pattern: pattern}
+	}
+	return nil
+}
+
+func validateAgainstPolicy(req executionRequest) error {
+	if err := validateGlobalDeny(req.Command); err != nil {
+		return err
+	}
+
+	capability := strings.ToLower(strings.TrimSpace(req.Capability))
+	policy, ok := capabilityPolicies[capability]
+	if !ok {
+		return nil
+	}
+
+	tokens := strings.Fields(req.Command)
+	if len(tokens) == 0 {
+		return policyValidationError{Message: "request command is empty"}
+	}
+
+	bin := normalizeBin(tokens[0])
+	if !stringInSlice(bin, policy.AllowedBins) {
+		return policyValidationError{Message: fmt.Sprintf("request binary %q denied by policy", bin)}
+	}
+
+	if len(tokens) < 2 {
+		return policyValidationError{Message: "request subcommand missing for policy"}
+	}
+	sub := strings.ToLower(tokens[1])
+	if len(policy.AllowedSub) > 0 && !policy.AllowedSub[sub] {
+		return policyValidationError{Message: fmt.Sprintf("request subcommand %q denied by policy", sub)}
+	}
+
+	for _, denyArg := range policy.DenyArgs {
+		denyArg = strings.ToLower(denyArg)
+		for _, token := range tokens[2:] {
+			if strings.HasPrefix(strings.ToLower(token), denyArg) {
+				return policyValidationError{Message: fmt.Sprintf("request argument %q denied by policy", denyArg)}
+			}
+		}
+	}
+
+	for _, key := range policy.RequireKeys {
+		if strings.TrimSpace(req.Params[key]) == "" {
+			return requestParamError{Param: key, Reason: "policy_missing"}
+		}
+	}
+
+	minRisk, ok := policy.MinRiskByTarget[strings.ToLower(strings.TrimSpace(req.Target))]
+	if ok && riskLessThan(req.RiskLevel, minRisk) {
+		return policyValidationError{Message: fmt.Sprintf("risk_level %s below minimum %s for target %s", strings.ToLower(req.RiskLevel), strings.ToLower(minRisk), req.Target)}
+	}
+
+	return nil
+}
+
+func validateGlobalDeny(command string) error {
+	normalized := strings.ToLower(command)
+	for _, denied := range globalDenySubstrings {
+		if strings.Contains(normalized, strings.ToLower(denied)) {
+			return policyValidationError{Message: "request command denied by global policy"}
+		}
+	}
+	return nil
+}
+
+func normalizeBin(token string) string {
+	base := filepath.Base(token)
+	base = strings.TrimSuffix(base, ".exe")
+	base = strings.TrimSuffix(base, ".cmd")
+	base = strings.TrimSuffix(base, ".bat")
+	return strings.ToLower(base)
+}
+
+func stringInSlice(value string, list []string) bool {
+	for _, item := range list {
+		if strings.EqualFold(item, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func riskLessThan(got, min string) bool {
+	gotRank, ok := riskRank[strings.ToLower(got)]
+	if !ok {
+		return false
+	}
+	minRank, ok := riskRank[strings.ToLower(min)]
+	if !ok {
+		return false
+	}
+	return gotRank < minRank
+}
+
+func approverAllowed(approver string, cfg policyConfig) bool {
+	if len(cfg.ApproverAllowlist) == 0 {
+		return true
+	}
+	for _, allowed := range cfg.ApproverAllowlist {
+		if strings.EqualFold(strings.TrimSpace(allowed), strings.TrimSpace(approver)) {
+			return true
+		}
+	}
+	return false
 }
 
 func handleSubmitCLI() {
@@ -599,23 +1734,31 @@ func approveRequest(id int, approver, comment string) error {
 		return fmt.Errorf("request %d already approved/executed", id)
 	}
 
-	allowCfg, err := loadAllowlist(allowlistFile)
+	policyCfg, err := loadPolicy(policyFile)
 	if err != nil {
-		return fmt.Errorf("failed to load allowlist: %w", err)
+		return fmt.Errorf("failed to load policy: %w", err)
 	}
-	cmdDef, ok := findAllowedCommand(rec.Request.Command, allowCfg)
-	if !ok {
-		cmdDef, ok = demoAllowedCommand(rec.Request)
-		if !ok {
-			return fmt.Errorf("requested command %q not in allowlist", rec.Request.Command)
+	if !approverAllowed(approver, policyCfg) {
+		now := time.Now().UTC()
+		rec.LastReviewBy = approver
+		rec.LastReviewAt = &now
+		rec.LastReviewDecision = "approval_rejected"
+		rec.LastReviewComment = comment
+		records[idx] = rec
+		if err := saveRequests(records); err != nil {
+			return err
 		}
+		appendAudit(rec.ID, rec.Request.AgentID, rec.Request.Intent, approver, "approval_rejected", false, "approver not in allowlist", rec.PolicyAction, rec.PolicyReasonCode, rec.PolicyReasonDetail)
+		return fmt.Errorf("approver %q not in allowlist", approver)
 	}
 
-	fmt.Println("Approved by human")
-	fmt.Println("Executing command...")
-	output, execErr := executeCommand(cmdDef)
-	exitCode := exitCodeFromError(execErr)
-	fmt.Println("Execution finished")
+	log.Printf("approve debug: command=%q capability=%q params=%v", rec.Request.Command, rec.Request.Capability, rec.Request.Params)
+
+	cmdDef, err := resolveAllowedCommand(rec.Request)
+	if err != nil {
+		return annotateRequestError(rec, err)
+	}
+
 	now := time.Now().UTC()
 
 	rec.Status = statusApproved
@@ -623,23 +1766,22 @@ func approveRequest(id int, approver, comment string) error {
 	rec.DecisionBy = approver
 	rec.DecisionAt = &now
 	rec.Comment = comment
-	rec.Executed = execErr == nil
-	if execErr != nil {
-		rec.ExecutionError = execErr.Error()
-	} else {
-		persistErr := persistOutput(rec, output, exitCode)
-		if persistErr != nil {
-			rec.ExecutionError = fmt.Sprintf("output persist failed: %v", persistErr)
-			rec.Executed = false
-		}
-	}
+	rec.LastReviewBy = approver
+	rec.LastReviewAt = &now
+	rec.LastReviewDecision = statusApproved
+	rec.LastReviewComment = comment
+
+	fmt.Fprintln(statusOutput, "Approved by human")
+	fmt.Fprintln(statusOutput, "Executing command...")
+	execErr := executeForRecord(&rec, cmdDef)
+	fmt.Fprintln(statusOutput, "Execution finished")
 
 	records[idx] = rec
 	if err := saveRequests(records); err != nil {
 		return err
 	}
 
-	appendAudit(rec.ID, rec.Request.AgentID, rec.Request.Intent, approver, statusApproved, rec.Executed, comment)
+	appendAudit(rec.ID, rec.Request.AgentID, rec.Request.Intent, approver, statusApproved, rec.Executed, comment, rec.PolicyAction, rec.PolicyReasonCode, rec.PolicyReasonDetail)
 	if execErr != nil {
 		return fmt.Errorf("execution failed: %w", execErr)
 	}
@@ -680,6 +1822,10 @@ func denyRequest(id int, approver, comment string) error {
 	rec.DecisionBy = approver
 	rec.DecisionAt = &now
 	rec.Comment = comment
+	rec.LastReviewBy = approver
+	rec.LastReviewAt = &now
+	rec.LastReviewDecision = statusDenied
+	rec.LastReviewComment = comment
 	rec.Executed = false
 
 	records[idx] = rec
@@ -687,7 +1833,7 @@ func denyRequest(id int, approver, comment string) error {
 		return err
 	}
 
-	appendAudit(rec.ID, rec.Request.AgentID, rec.Request.Intent, approver, statusDenied, false, comment)
+	appendAudit(rec.ID, rec.Request.AgentID, rec.Request.Intent, approver, statusDenied, false, comment, rec.PolicyAction, rec.PolicyReasonCode, rec.PolicyReasonDetail)
 	return nil
 }
 
@@ -698,6 +1844,22 @@ func executeCommand(cmdDef allowedCommand) ([]byte, error) {
 	cmd.Stderr = &buf
 	err := cmd.Run()
 	return buf.Bytes(), err
+}
+
+func executeForRecord(rec *requestRecord, cmdDef allowedCommand) error {
+	output, execErr := executeCommand(cmdDef)
+	exitCode := exitCodeFromError(execErr)
+	rec.Executed = execErr == nil
+	if execErr != nil {
+		rec.ExecutionError = execErr.Error()
+		return execErr
+	}
+	if persistErr := persistOutput(*rec, output, exitCode); persistErr != nil {
+		rec.ExecutionError = fmt.Sprintf("output persist failed: %v", persistErr)
+		rec.Executed = false
+		return persistErr
+	}
+	return nil
 }
 
 func exitCodeFromError(err error) int {
@@ -711,16 +1873,19 @@ func exitCodeFromError(err error) int {
 	return -1
 }
 
-func appendAudit(requestID int, agentID, intent, approver, decision string, executed bool, comment string) {
+func appendAudit(requestID int, agentID, intent, approver, decision string, executed bool, comment, policyAction, policyReasonCode, policyReasonDetail string) {
 	entry := auditEntry{
-		RequestID:  requestID,
-		AgentID:    agentID,
-		Intent:     intent,
-		ApprovedBy: approver,
-		Decision:   decision,
-		Executed:   executed,
-		Timestamp:  time.Now().UTC().Format(time.RFC3339),
-		Comment:    comment,
+		RequestID:          requestID,
+		AgentID:            agentID,
+		Intent:             intent,
+		ApprovedBy:         approver,
+		Decision:           decision,
+		Executed:           executed,
+		Timestamp:          time.Now().UTC().Format(time.RFC3339),
+		Comment:            comment,
+		PolicyAction:       policyAction,
+		PolicyReasonCode:   policyReasonCode,
+		PolicyReasonDetail: policyReasonDetail,
 	}
 
 	data, err := json.Marshal(entry)

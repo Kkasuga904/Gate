@@ -1,1 +1,4 @@
 aag.exe
+outputs/
+audit.log
+requests.json

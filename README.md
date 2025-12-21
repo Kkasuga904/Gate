@@ -142,6 +142,14 @@ Response:
 }
 ```
 
+## MCP (stdio JSON-RPC)
+
+In MCP mode, stdout is reserved for JSON-RPC frames only. All logs and debug output go to stderr.
+
+```powershell
+go run . mcp
+```
+
 ## CLI approval flow
 
 ### Approve and execute

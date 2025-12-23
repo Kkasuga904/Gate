@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":1,"method":"gate.execute_request","params":{"agent_id":"demo","intent":"execute","target":"dev","capability":"exit_1","params":{},"risk_level":"low","reason":"test failure stats"}}
+{"jsonrpc":"2.0","id":2,"method":"gate.approve","params":{"request_id":{{request_id}},"user":"human_01","comment":"approve and let it fail"}}

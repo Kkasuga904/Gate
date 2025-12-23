@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":1,"method":"gate.list_requests","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"gate.approve","params":{"request_id":2,"user":"human_01","comment":"cleanup approve"}}

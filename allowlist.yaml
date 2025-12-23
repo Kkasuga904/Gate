@@ -6,3 +6,17 @@ commands:
   - name: gather_logs
     path: "C:\\Windows\\System32\\wevtutil.exe"
     args: ["qe", "System", "/c:10"]
+
+  - name: echo_test
+    path: "C:\\Windows\\System32\\cmd.exe"
+    args: ["/C", "echo", "{TEXT}"]
+    vars:
+      TEXT:
+        pattern: "^[A-Za-z0-9._-]{1,32}$"
+
+  - name: exit_1
+    path: "C:\\Windows\\System32\\cmd.exe"
+    args: ["/C", "exit", "1"]
+    vars:
+      DUMMY:
+        pattern: "^(x)?$"

@@ -1,8 +1,0 @@
-Request ID: 2
-Command: rmdir /s /q C:\temp\gate-test
-Decision: approved
-Approved By: you
-Exit Code: 0
-
---- Output ---
-(no output)

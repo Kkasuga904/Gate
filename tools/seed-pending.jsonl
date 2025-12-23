@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":1,"method":"gate.execute_request","params":{"agent_id":"demo","intent":"execute","target":"dev","capability":"echo_test","params":{"TEXT":"p1"},"risk_level":"low","reason":"seed pending 1"}}
+{"jsonrpc":"2.0","id":2,"method":"gate.execute_request","params":{"agent_id":"demo","intent":"execute","target":"dev","capability":"echo_test","params":{"TEXT":"p2"},"risk_level":"low","reason":"seed pending 2"}}

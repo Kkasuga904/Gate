@@ -77,9 +77,14 @@ Example:
     "intent": "gather_logs",
     "env": "test",
     "target": "host01",
-    "command": "gather_logs",
+    "capability": "gather_logs",
+    "params": {},
     "reason": "diag",
     "risk_level": "medium"
+  },
+  "resolved_command": {
+    "path": "C:\\Windows\\System32\\wevtutil.exe",
+    "args": ["qe", "System", "/c:10"]
   },
   "status": "approved",
   "decision": "approved",
@@ -126,7 +131,8 @@ curl.exe -X POST http://localhost:8080/execution/request `
     "intent": "gather_logs",
     "env": "test",
     "target": "host01",
-    "command": "gather_logs",
+    "capability": "gather_logs",
+    "params": {},
     "reason": "diagnostics",
     "risk_level": "medium"
   }'
@@ -142,6 +148,46 @@ Response:
 }
 ```
 
+### Request schema (command-less)
+
+Required fields:
+- `agent_id`
+- `intent`
+- `target`
+- `capability`
+- `params`
+- `reason`
+- `risk_level`
+
+Optional fields:
+- `env`
+- `resources`
+- `operation`
+
+The `command` field is rejected. Use `capability` + `params` only.
+
+### Allowlist resolution
+
+`allowlist.yaml` defines the executable path and args for each capability:
+
+```yaml
+commands:
+  - name: restart_service
+    path: "C:\\Windows\\System32\\net.exe"
+    args: ["stop", "Spooler"]
+
+  - name: echo_test
+    path: "C:\\Windows\\System32\\cmd.exe"
+    args: ["/C", "echo", "{TEXT}"]
+    vars:
+      TEXT:
+        pattern: "^[A-Za-z0-9._-]{1,32}$"
+```
+
+Placeholders in args use `{PARAM}` and are replaced from request `params`.
+If required params are missing or validation fails, the request is rejected.
+Execution uses `exec.Command(path, args...)` only (no shell string execution).
+
 ## MCP (stdio JSON-RPC)
 
 In MCP mode, stdout is reserved for JSON-RPC frames only. All logs and debug output go to stderr.
@@ -149,6 +195,106 @@ In MCP mode, stdout is reserved for JSON-RPC frames only. All logs and debug out
 ```powershell
 go run . mcp
 ```
+
+### MCP methods
+
+Key methods:
+- `gate.execute_request`
+- `gate.approve`
+- `gate.deny`
+- `gate.get_request`
+- `gate.list_requests`
+- `gate.review_request`
+- `gate.list_capabilities`
+
+`gate.approve` and `gate.deny` work as the first request in a session (no warm-up call required).
+
+Example `gate.execute_request`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "gate.execute_request",
+  "params": {
+    "agent_id": "triage-ai",
+    "intent": "gather_logs",
+    "target": "host01",
+    "capability": "gather_logs",
+    "params": {},
+    "reason": "diagnostics",
+    "risk_level": "medium"
+  }
+}
+```
+
+Example `gate.get_request`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "gate.get_request",
+  "params": { "request_id": 5 }
+}
+```
+
+Example `gate.list_requests`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "gate.list_requests",
+  "params": { "status": "pending", "limit": 50 }
+}
+```
+
+Example `gate.review_request`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "gate.review_request",
+  "params": { "request_id": 5 }
+}
+```
+
+Review responses include deterministic stats:
+- `similar_strict_count` / `strict_success_rate` (capability + path + args + target)
+- `similar_relaxed_count` / `relaxed_success_rate` (capability + path + target, args ignored)
+- `capability_history_count` (capability + target history)
+- `anomaly_score` with an explicit formula in `explanation_basis` (relaxed-based)
+- Similarity uses `target` (lowercased/trimmed, empty -> `unknown`)
+Executed outcomes only:
+- strict/relaxed success rates exclude pending/denied requests
+- `similar_pending_count` and `similar_denied_count` are reported for context
+Backward compatibility:
+- `similar_cases_count` and `historical_success_rate` mirror the relaxed values
+
+### MCP client (PowerShell)
+
+Use `tools/mcp_send.ps1` to send multiple frames over a single MCP session.
+
+```powershell
+.\tools\mcp_send.ps1 -ServerExe go -ServerArgs @("run",".","mcp") `
+  -RequestsFile .\tools\requests-demo.jsonl -Pretty -Verbose -TimeoutMs 5000
+```
+
+`tools/requests-demo.jsonl` uses a `{{request_id}}` placeholder in subsequent frames,
+which is replaced with the `request_id` returned by `gate.execute_request`.
+`-TimeoutMs` controls the stdout read timeout (milliseconds).
+
+### MCP client (Go)
+
+`cmd/gatec` provides the same framing behavior for automation:
+
+```powershell
+go run .\cmd\gatec\main.go send --file .\tools\requests-demo.jsonl --pretty
+```
+
+If auto-approve is enabled and triggered, review also includes `auto_approved` and `auto_approve_reason`.
 
 ## CLI approval flow
 

@@ -1,0 +1,3 @@
+{"jsonrpc":"2.0","id":1,"method":"gate.execute_request","params":{"agent_id":"demo","intent":"execute","target":"dev","capability":"echo_test","params":{"TEXT":"e2e"},"risk_level":"low","reason":"e2e file"}}
+{"jsonrpc":"2.0","id":2,"method":"gate.review_request","params":{"request_id":"{{request_id}}"}}
+{"jsonrpc":"2.0","id":3,"method":"gate.approve","params":{"request_id":"{{request_id}}","user":"human_01","comment":"e2e approve"}} 

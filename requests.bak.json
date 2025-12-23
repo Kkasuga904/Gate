@@ -2,76 +2,46 @@
   {
     "id": 1,
     "request": {
-      "agent_id": "demo",
-      "intent": "execute",
+      "agent_id": "claude-code",
+      "intent": "delete_dir",
       "env": "",
-      "target": "dev",
-      "reason": "seed executed success A",
-      "risk_level": "low",
-      "capability": "echo_test",
-      "params": {
-        "TEXT": "ok1"
-      }
+      "target": "C:\\temp\\gate-test",
+      "command": "rmdir /s /q C:\\temp\\gate-test",
+      "reason": "cleanup after test",
+      "risk_level": "high"
     },
     "status": "approved",
-    "require_approval": true,
-    "policy_action": "require_approval",
-    "policy_reason_code": "DEFAULT_REQUIRE_APPROVAL",
-    "policy_reason_detail": "default_action require_approval",
-    "decision_by": "human_01",
-    "decision_at": "2025-12-22T08:31:35.2716586Z",
+    "require_approval": false,
+    "decision_by": "you",
+    "decision_at": "2025-12-20T12:15:38.2757936Z",
     "decision": "approved",
-    "comment": "approve A",
-    "last_review_by": "human_01",
-    "last_review_at": "2025-12-22T08:31:35.2716586Z",
-    "last_review_decision": "approved",
-    "last_review_comment": "approve A",
-    "resolved_command": {
-      "path": "C:\\Windows\\System32\\cmd.exe",
-      "args": [
-        "/C",
-        "echo",
-        "ok1"
-      ]
-    },
-    "executed": true,
-    "execution": {
-      "exit_code": 0,
-      "status": "success"
-    },
-    "created_at": "2025-12-22T08:31:35.24337Z",
-    "updated_at": "2025-12-22T08:31:35.2716586Z"
+    "comment": "approved",
+    "resolved_command": {},
+    "executed": false,
+    "created_at": "0001-01-01T00:00:00Z",
+    "updated_at": "0001-01-01T00:00:00Z"
   },
   {
     "id": 2,
     "request": {
-      "agent_id": "demo",
-      "intent": "execute",
+      "agent_id": "claude-code",
+      "intent": "delete_dir",
       "env": "",
-      "target": "dev",
-      "reason": "seed pending 1",
-      "risk_level": "low",
-      "capability": "echo_test",
-      "params": {
-        "TEXT": "p1"
-      }
+      "target": "C:\\temp\\gate-test",
+      "command": "rmdir /s /q C:\\temp\\gate-test",
+      "reason": "cleanup after test",
+      "risk_level": "high"
     },
-    "status": "pending",
-    "require_approval": true,
-    "policy_action": "require_approval",
-    "policy_reason_code": "DEFAULT_REQUIRE_APPROVAL",
-    "policy_reason_detail": "default_action require_approval",
-    "resolved_command": {
-      "path": "C:\\Windows\\System32\\cmd.exe",
-      "args": [
-        "/C",
-        "echo",
-        "p1"
-      ]
-    },
-    "executed": false,
-    "created_at": "2025-12-22T08:31:43.5309608Z",
-    "updated_at": "2025-12-22T08:31:43.5309608Z"
+    "status": "approved",
+    "require_approval": false,
+    "decision_by": "you",
+    "decision_at": "2025-12-20T12:18:49.2828716Z",
+    "decision": "approved",
+    "comment": "approved",
+    "resolved_command": {},
+    "executed": true,
+    "created_at": "0001-01-01T00:00:00Z",
+    "updated_at": "0001-01-01T00:00:00Z"
   },
   {
     "id": 3,
@@ -80,11 +50,11 @@
       "intent": "execute",
       "env": "",
       "target": "dev",
-      "reason": "seed pending 2",
+      "reason": "demo run",
       "risk_level": "low",
       "capability": "echo_test",
       "params": {
-        "TEXT": "p2"
+        "TEXT": "demo"
       }
     },
     "status": "pending",
@@ -97,12 +67,12 @@
       "args": [
         "/C",
         "echo",
-        "p2"
+        "demo"
       ]
     },
     "executed": false,
-    "created_at": "2025-12-22T08:31:43.5591792Z",
-    "updated_at": "2025-12-22T08:31:43.5591792Z"
+    "created_at": "2025-12-22T05:58:55.9980283Z",
+    "updated_at": "2025-12-22T05:58:55.9980283Z"
   },
   {
     "id": 4,
@@ -111,37 +81,29 @@
       "intent": "execute",
       "env": "",
       "target": "dev",
-      "reason": "seed denied",
+      "reason": "demo run",
       "risk_level": "low",
       "capability": "echo_test",
       "params": {
-        "TEXT": "d1"
+        "TEXT": "demo"
       }
     },
-    "status": "denied",
+    "status": "pending",
     "require_approval": true,
     "policy_action": "require_approval",
     "policy_reason_code": "DEFAULT_REQUIRE_APPROVAL",
     "policy_reason_detail": "default_action require_approval",
-    "decision_by": "human_01",
-    "decision_at": "2025-12-22T08:31:50.1909959Z",
-    "decision": "denied",
-    "comment": "deny 1",
-    "last_review_by": "human_01",
-    "last_review_at": "2025-12-22T08:31:50.1909959Z",
-    "last_review_decision": "denied",
-    "last_review_comment": "deny 1",
     "resolved_command": {
       "path": "C:\\Windows\\System32\\cmd.exe",
       "args": [
         "/C",
         "echo",
-        "d1"
+        "demo"
       ]
     },
     "executed": false,
-    "created_at": "2025-12-22T08:31:50.1411165Z",
-    "updated_at": "2025-12-22T08:31:50.1909959Z"
+    "created_at": "2025-12-22T06:07:33.5768041Z",
+    "updated_at": "2025-12-22T06:07:33.5768041Z"
   },
   {
     "id": 5,
@@ -150,41 +112,29 @@
       "intent": "execute",
       "env": "",
       "target": "dev",
-      "reason": "seed executed success B",
+      "reason": "demo run",
       "risk_level": "low",
       "capability": "echo_test",
       "params": {
-        "TEXT": "ok2"
+        "TEXT": "demo"
       }
     },
-    "status": "approved",
+    "status": "pending",
     "require_approval": true,
     "policy_action": "require_approval",
     "policy_reason_code": "DEFAULT_REQUIRE_APPROVAL",
     "policy_reason_detail": "default_action require_approval",
-    "decision_by": "human_01",
-    "decision_at": "2025-12-22T08:34:40.1620325Z",
-    "decision": "approved",
-    "comment": "approve B",
-    "last_review_by": "human_01",
-    "last_review_at": "2025-12-22T08:34:40.1620325Z",
-    "last_review_decision": "approved",
-    "last_review_comment": "approve B",
     "resolved_command": {
       "path": "C:\\Windows\\System32\\cmd.exe",
       "args": [
         "/C",
         "echo",
-        "ok2"
+        "demo"
       ]
     },
-    "executed": true,
-    "execution": {
-      "exit_code": 0,
-      "status": "success"
-    },
-    "created_at": "2025-12-22T08:34:40.1341387Z",
-    "updated_at": "2025-12-22T08:34:40.1620325Z"
+    "executed": false,
+    "created_at": "2025-12-22T06:14:12.2739957Z",
+    "updated_at": "2025-12-22T06:14:12.2739957Z"
   },
   {
     "id": 6,
@@ -193,11 +143,42 @@
       "intent": "execute",
       "env": "",
       "target": "dev",
-      "reason": "seed executed same args ok1 again",
+      "reason": "demo run",
       "risk_level": "low",
       "capability": "echo_test",
       "params": {
-        "TEXT": "ok1"
+        "TEXT": "demo"
+      }
+    },
+    "status": "pending",
+    "require_approval": true,
+    "policy_action": "require_approval",
+    "policy_reason_code": "DEFAULT_REQUIRE_APPROVAL",
+    "policy_reason_detail": "default_action require_approval",
+    "resolved_command": {
+      "path": "C:\\Windows\\System32\\cmd.exe",
+      "args": [
+        "/C",
+        "echo",
+        "demo"
+      ]
+    },
+    "executed": false,
+    "created_at": "2025-12-22T06:15:04.1392271Z",
+    "updated_at": "2025-12-22T06:15:04.1392271Z"
+  },
+  {
+    "id": 7,
+    "request": {
+      "agent_id": "demo",
+      "intent": "execute",
+      "env": "",
+      "target": "dev",
+      "reason": "demo run",
+      "risk_level": "low",
+      "capability": "echo_test",
+      "params": {
+        "TEXT": "demo"
       }
     },
     "status": "approved",
@@ -206,19 +187,19 @@
     "policy_reason_code": "DEFAULT_REQUIRE_APPROVAL",
     "policy_reason_detail": "default_action require_approval",
     "decision_by": "human_01",
-    "decision_at": "2025-12-22T08:38:42.4728784Z",
+    "decision_at": "2025-12-22T06:24:17.0397376Z",
     "decision": "approved",
-    "comment": "approve ok1 again",
+    "comment": "ok",
     "last_review_by": "human_01",
-    "last_review_at": "2025-12-22T08:38:42.4728784Z",
+    "last_review_at": "2025-12-22T06:24:17.0397376Z",
     "last_review_decision": "approved",
-    "last_review_comment": "approve ok1 again",
+    "last_review_comment": "ok",
     "resolved_command": {
       "path": "C:\\Windows\\System32\\cmd.exe",
       "args": [
         "/C",
         "echo",
-        "ok1"
+        "demo"
       ]
     },
     "executed": true,
@@ -226,7 +207,7 @@
       "exit_code": 0,
       "status": "success"
     },
-    "created_at": "2025-12-22T08:38:42.441397Z",
-    "updated_at": "2025-12-22T08:38:42.4728784Z"
+    "created_at": "2025-12-22T06:24:16.9036138Z",
+    "updated_at": "2025-12-22T06:24:17.0397376Z"
   }
 ]

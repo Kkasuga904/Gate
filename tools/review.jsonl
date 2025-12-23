@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"method":"gate.review_request","params":{"agent_id":"demo","intent":"execute","target":"dev","capability":"echo_test","params":{"TEXT":"ok2"},"risk_level":"low","reason":"review strict0 relaxed1"}}
